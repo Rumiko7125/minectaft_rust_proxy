@@ -428,7 +428,7 @@ async fn handle_login(
                     &backend_msgs,
                     target.limbo_message.as_deref(),
                 )
-                .await;
+                    .await;
                 match result {
                     Ok(limbo::LimboResult::Verified) => {
                         tracing::info!("Player {} 2FA verified, please reconnect", username);
@@ -456,7 +456,7 @@ async fn handle_login(
                     &backend_msgs,
                     target.limbo_message.as_deref(),
                 )
-                .await;
+                    .await;
                 match result {
                     Ok(limbo::LimboResult::SetupComplete) => {
                         tracing::info!("Player {} 2FA setup complete", username);
@@ -508,12 +508,11 @@ async fn handle_login(
     })?;
     server.set_nodelay(true).ok();
 
-    // 10. Forward Handshake to backend
+    // 10+11. Forward Handshake + Login to backend in a single write (1 syscall instead of 2)
     let target_handshake = handshake.with_target(&target.target_addr, target.target_port);
-    target_handshake.to_raw().write_to(&mut server).await?;
-
-    // 11. Forward raw Login packet to backend
-    login_raw.write_to(&mut server).await?;
+    let mut init_buf = target_handshake.to_raw().to_bytes();
+    init_buf.extend_from_slice(&login_raw.to_bytes());
+    server.write_all(&init_buf).await?;
 
     // 12. Register online user
     let login_timestamp = std::time::SystemTime::now()
@@ -529,7 +528,7 @@ async fn handle_login(
         target.target_port,
         handshake.protocol_version,
     )
-    .await
+        .await
     {
         Ok(id) => Some(id),
         Err(e) => {
@@ -581,7 +580,7 @@ async fn handle_login(
             download,
             kick_reason.as_deref(),
         )
-        .await
+            .await
         {
             tracing::warn!("Failed to update session for {}: {}", username, e);
         }
@@ -606,52 +605,72 @@ async fn handle_login(
     result
 }
 
-/// Raw TCP bidirectional relay
+/// Raw TCP bidirectional relay - split streams for true concurrent forwarding.
+///
+/// By splitting each TcpStream into independent read/write halves, both directions
+/// can make progress simultaneously. Previously, write_all() in one direction
+/// would block the read() poll in the other direction inside select!.
 async fn forward_raw_tcp(
     client: &mut TcpStream,
     server: &mut TcpStream,
     user: &super::UserInfo,
 ) -> Result<()> {
-    let mut client_buf = vec![0u8; 32768];
-    let mut server_buf = vec![0u8; 32768];
+    let (mut cr, mut cw) = client.split();
+    let (mut sr, mut sw) = server.split();
 
-    loop {
-        tokio::select! {
-            result = client.read(&mut client_buf) => {
-                let n = result?;
-                if n == 0 {
-                    tracing::debug!("Player {} client closed connection", user.username);
-                    break;
-                }
-                if user.kick_flag.load(Ordering::SeqCst) {
-                    tracing::info!("Player {} kicked, closing connection", user.username);
-                    break;
-                }
-                user.upload_bytes.fetch_add(n as u64, Ordering::Relaxed);
-                server.write_all(&client_buf[..n]).await?;
+    let upload = &user.upload_bytes;
+    let download = &user.download_bytes;
+    let kick = &user.kick_flag;
+    let username = &user.username;
+
+    // Client → Server
+    let c2s = async {
+        let mut buf = vec![0u8; 32768];
+        loop {
+            let n = cr.read(&mut buf).await?;
+            if n == 0 {
+                tracing::debug!("Player {} client closed connection", username);
+                return Ok::<_, std::io::Error>(());
             }
-            result = server.read(&mut server_buf) => {
-                let n = result?;
-                if n == 0 {
-                    let down = user.download_bytes.load(Ordering::Relaxed);
-                    if down == 0 {
-                        tracing::warn!(
-                            "Player {} backend closed connection immediately (0 bytes received) - check backend server configuration",
-                            user.username
-                        );
-                    } else {
-                        tracing::debug!("Player {} backend closed connection", user.username);
-                    }
-                    break;
-                }
-                if user.kick_flag.load(Ordering::SeqCst) {
-                    tracing::info!("Player {} kicked, closing connection", user.username);
-                    break;
-                }
-                user.download_bytes.fetch_add(n as u64, Ordering::Relaxed);
-                client.write_all(&server_buf[..n]).await?;
+            if kick.load(Ordering::Relaxed) {
+                tracing::info!("Player {} kicked, closing connection", username);
+                return Ok(());
             }
+            upload.fetch_add(n as u64, Ordering::Relaxed);
+            sw.write_all(&buf[..n]).await?;
         }
+    };
+
+    // Server → Client
+    let s2c = async {
+        let mut buf = vec![0u8; 32768];
+        loop {
+            let n = sr.read(&mut buf).await?;
+            if n == 0 {
+                let down = download.load(Ordering::Relaxed);
+                if down == 0 {
+                    tracing::warn!(
+                        "Player {} backend closed connection immediately (0 bytes received) - check backend server configuration",
+                        username
+                    );
+                } else {
+                    tracing::debug!("Player {} backend closed connection", username);
+                }
+                return Ok::<_, std::io::Error>(());
+            }
+            if kick.load(Ordering::Relaxed) {
+                tracing::info!("Player {} kicked, closing connection", username);
+                return Ok(());
+            }
+            download.fetch_add(n as u64, Ordering::Relaxed);
+            cw.write_all(&buf[..n]).await?;
+        }
+    };
+
+    // Both directions run concurrently; when either ends, we stop
+    tokio::select! {
+        r = c2s => { r.map_err(ProxyError::Io)?; }
+        r = s2c => { r.map_err(ProxyError::Io)?; }
     }
 
     Ok(())
