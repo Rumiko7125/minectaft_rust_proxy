@@ -71,7 +71,7 @@ jobs:
 
           # macOS Intel
           - name: macOS Intel (x86_64)
-            os: macos-12
+            os: macos-14
             target: x86_64-apple-darwin
             binary: minecraft-rust-proxy
             archive: minecraft-rust-proxy-macos-x86_64.tar.gz
@@ -132,14 +132,19 @@ jobs:
         if: runner.os != 'Windows'
         run: |
           cp target/${{ matrix.target }}/release/${{ matrix.binary }} ${{ matrix.binary }}
-          tar czf ${{ matrix.archive }} ${{ matrix.binary }}
+          tar czf ${{ matrix.archive }} ${{ matrix.binary }} i18n migrations web/dist
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.binary }}" -Destination "${{ matrix.binary }}"
-          Compress-Archive -Path "${{ matrix.binary }}" -DestinationPath "${{ matrix.archive }}"
+          New-Item -ItemType Directory -Path staging | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.binary }}" -Destination "staging/${{ matrix.binary }}"
+          Copy-Item -Recurse "i18n"       -Destination "staging/i18n"
+          Copy-Item -Recurse "migrations" -Destination "staging/migrations"
+          New-Item -ItemType Directory -Path "staging/web" | Out-Null
+          Copy-Item -Recurse "web/dist"   -Destination "staging/web/dist"
+          Compress-Archive -Path "staging/*" -DestinationPath "${{ matrix.archive }}"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
